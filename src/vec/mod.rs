@@ -1353,6 +1353,130 @@ impl<T, LenT: LenType, S: VecStorage<T> + ?Sized> VecInner<T, LenT, S> {
     pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
         &mut self.buffer.borrow_mut()[self.len.into_usize()..]
     }
+
+    /// Dedup
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.dedup_by(|a, b| a == b);
+    }
+
+    /// Dedup by
+    pub fn dedup_by<F>(&mut self, mut same_bucket: F)
+    where
+        F: FnMut(&mut T, &mut T) -> bool,
+    {
+        let len = self.len();
+        if len <= 1 {
+            return;
+        }
+
+        let ptr = self.as_mut_ptr();
+        let mut first_duplicate_idx = 1;
+        while first_duplicate_idx != len {
+            // SAFETY: first_duplicate always in range [1..len)
+            // Note that we start iteration at 1 so we never overflow.
+            let found_duplicate = unsafe {
+                let prev = ptr.add(first_duplicate_idx.wrapping_sub(1));
+                let current = ptr.add(first_duplicate_idx);
+                same_bucket(&mut *current, &mut *prev)
+            };
+            if found_duplicate {
+                break;
+            }
+
+            first_duplicate_idx += 1;
+        }
+
+        // There is nothing to remove.
+        if first_duplicate_idx == len {
+            return;
+        }
+
+        // INVARIANT: vec.len() > read > write > write-1 >= 0
+        struct FillGapOnDrop<'a, T, LenT: LenType, S: VecStorage<T> + ?Sized> {
+            /// Offset of the element we want to check if it is a duplicate
+            read: usize,
+            /// Offset of the place where we want to place the non-duplicate
+            /// when we find it.
+            write: usize,
+            /// The `Vec` that would need correction if `same_bucket` panicked.
+            vec: &'a mut VecInner<T, LenT, S>,
+        }
+
+        impl<T, LenT: LenType, S: VecStorage<T> + ?Sized> Drop for FillGapOnDrop<'_, T, LenT, S> {
+            fn drop(&mut self) {
+                // This code only gets executed if/when `same_bucket` panics.
+
+                // SAFETY: invariant guarantees that `read - write` and `len - read` never overflow
+                // and that the copy is always in-bounds.
+                unsafe {
+                    let ptr = self.vec.as_mut_ptr();
+                    let len = self.vec.len();
+                    let items_left = len.wrapping_sub(self.read);
+                    let dropped = self.read.wrapping_sub(self.write);
+
+                    ptr::copy(ptr.add(self.read), ptr.add(self.write), items_left);
+
+                    self.vec.set_len(len - dropped);
+                }
+            }
+        }
+
+        let mut gap = FillGapOnDrop {
+            read: first_duplicate_idx + 1,
+            write: first_duplicate_idx,
+            vec: self,
+        };
+
+        // Miri flags the original `ptr` as invalid here because moving
+        // `self` into `gap.vec` creates a new unique borrow, which
+        // invalidates any pointers derived from the old `&mut self`.
+        let ptr = gap.vec.as_mut_ptr();
+
+        // SAFETY: we checked that first_duplicate_idx in bounds before.
+        unsafe {
+            ptr::drop_in_place(ptr.add(first_duplicate_idx));
+        }
+
+        // SAFETY: Because of the invariant, read_ptr, prev_ptr, and write_ptr
+        // are always in-bounds and read_ptr never aliases prev_ptr.
+        unsafe {
+            while gap.read < len {
+                let read_ptr = ptr.add(gap.read);
+                let prev_ptr = ptr.add(gap.write.wrapping_sub(1));
+
+                if same_bucket(&mut *read_ptr, &mut *prev_ptr) {
+                    // Found a duplicate: increment read to skip it, then advance read
+                    // past it. We must update `gap.read` before dropping to maintain the
+                    // invariant in case drop panics.
+                    gap.read += 1;
+                    ptr::drop_in_place(read_ptr);
+                } else {
+                    // not a duplicate: move it into the write position.
+                    let write_ptr = ptr.add(gap.write);
+                    // read_ptr cannot be equal to write_ptr because we have guaranteed
+                    // at this point to skip at least one element.
+                    ptr::copy_nonoverlapping(read_ptr, write_ptr, 1);
+                    gap.write += 1;
+                    gap.read += 1;
+                }
+            }
+
+            gap.vec.set_len(gap.write);
+            core::mem::forget(gap);
+        }
+    }
+
+    /// ddbk
+    pub fn dedup_by_key<F, K>(&mut self, mut key: F)
+    where
+        F: FnMut(&mut T) -> K,
+        K: PartialEq,
+    {
+        self.dedup_by(|a, b| key(a) == key(b));
+    }
 }
 
 // Trait implementations
@@ -2515,6 +2639,42 @@ mod tests {
         for i in 0..8 {
             assert_eq!(view[i], 0);
         }
+    }
+
+    #[test]
+    fn dedup() {
+        let mut v: Vec<i32, 8> = Vec::from_array([1, 2, 2, 3, 2]);
+        v.dedup();
+        assert_eq!(v, [1, 2, 3, 2]);
+    }
+
+    #[test]
+    fn dedup_all_same() {
+        let mut v: Vec<i32, 8> = Vec::from_array([1, 1, 1, 1]);
+        v.dedup();
+        assert_eq!(v, [1]);
+    }
+
+    #[test]
+    fn dedup_on_vecview() {
+        let mut v: Vec<i32, 8> = Vec::from_array([1, 1, 2, 2, 3]);
+        let view: &mut VecView<i32> = &mut v;
+        view.dedup();
+        assert_eq!(&*view, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn dedup_by_case_insensitive() {
+        let mut v: Vec<&str, 8> = Vec::from_array(["foo", "bar", "Bar", "baz", "bar"]);
+        v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        assert_eq!(v, ["foo", "bar", "baz", "bar"]);
+    }
+
+    #[test]
+    fn dedup_by_key_integer_divison() {
+        let mut v: Vec<i32, 8> = Vec::from_array([10, 20, 21, 30, 20]);
+        v.dedup_by_key(|i| *i / 10);
+        assert_eq!(v, [10, 20, 30, 20]);
     }
 
     fn _test_variance<'a: 'b, 'b>(x: Vec<&'a (), 42>) -> Vec<&'b (), 42> {
